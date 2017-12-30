@@ -129,3 +129,31 @@ INSERT INTO "test_tz" VALUES('2017-09-21 19:01:00', 21.2);
 
 SELECT * FROM test.show_constraints('_timescaledb_internal._hyper_10_20_chunk');
 SELECT * FROM test_tz;
+
+--test rollback
+BEGIN;
+\set QUIET off
+CREATE TABLE "data_records" ("time" bigint NOT NULL, "value" integer CHECK (VALUE >= 0));
+SELECT create_hypertable('data_records', 'time', chunk_time_interval => 2592000000);
+
+INSERT INTO "data_records" ("time", "value") VALUES (0, 1);
+SAVEPOINT savepoint_1;
+INSERT INTO "data_records" ("time", "value") VALUES (1, 0);
+ROLLBACK TO SAVEPOINT savepoint_1;
+INSERT INTO "data_records" ("time", "value") VALUES (2, 1);
+
+SAVEPOINT savepoint_2;
+\set ON_ERROR_STOP 0
+INSERT INTO "data_records" ("time", "value") VALUES (3, -1);
+\set ON_ERROR_STOP 1
+ROLLBACK TO SAVEPOINT savepoint_2;
+INSERT INTO "data_records" ("time", "value") VALUES (4, 1);
+
+SAVEPOINT savepoint_3;
+INSERT INTO "data_records" ("time", "value") VALUES (5, 0);
+ROLLBACK TO SAVEPOINT savepoint_3;
+
+SELECT * FROM data_records;
+
+\set QUIET on
+ROLLBACK;
