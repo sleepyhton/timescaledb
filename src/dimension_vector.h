@@ -28,6 +28,7 @@ extern DimensionVec *dimension_vec_add_slice_sort(DimensionVec **vec, DimensionS
 extern DimensionVec *dimension_vec_add_slice(DimensionVec **vecptr, DimensionSlice *slice);
 extern void dimension_vec_remove_slice(DimensionVec **vecptr, int32 index);
 extern DimensionSlice *dimension_vec_find_slice(DimensionVec *vec, int64 coordinate);
+extern DimensionSlice *dimension_vec_get(DimensionVec *vec, int32 index);
 extern void dimension_vec_free(DimensionVec *vec);
 
 #endif   /* TIMESCALEDB_DIMENSION_VECTOR_H */

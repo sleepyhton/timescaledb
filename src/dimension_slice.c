@@ -357,7 +357,7 @@ dimension_slice_insert_relation(Relation rel, DimensionSlice *slice)
 	values[Anum_dimension_slice_id - 1] = Int32GetDatum(slice->fd.id);
 	values[Anum_dimension_slice_dimension_id - 1] = Int32GetDatum(slice->fd.dimension_id);
 	values[Anum_dimension_slice_range_start - 1] = Int64GetDatum(slice->fd.range_start);
-	values[Anum_dimension_slice_range_end - 1] =Int64GetDatum(slice->fd.range_end);
+	values[Anum_dimension_slice_range_end - 1] = Int64GetDatum(slice->fd.range_end);
 
 	catalog_insert_values(rel, desc, values, nulls);
 
