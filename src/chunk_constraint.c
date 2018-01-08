@@ -11,8 +11,10 @@
 #include <catalog/pg_constraint.h>
 #include <catalog/pg_constraint_fn.h>
 #include <catalog/objectaddress.h>
+#include <commands/tablecmds.h>
 #include <catalog/dependency.h>
 #include <funcapi.h>
+#include <nodes/makefuncs.h>
 
 #include "scanner.h"
 #include "chunk_constraint.h"
@@ -65,6 +67,36 @@ chunk_constraints_expand(ChunkConstraints *ccs, int16 new_capacity)
 	ccs->constraints = repalloc(ccs->constraints, CHUNK_CONSTRAINTS_SIZE(new_capacity));
 }
 
+
+static
+void
+chunk_constraint_choose_name(Name dst, bool is_dimension, int32 dimension_slice_id, const char *hypertable_constraint_name, int32 chunk_id)
+{
+	if (is_dimension)
+	{
+		snprintf(NameStr(*dst), NAMEDATALEN, "constraint_%d",
+				 dimension_slice_id);
+	}
+	else
+	{
+		char		constrname[100];
+		CatalogSecurityContext sec_ctx;
+
+		Assert(hypertable_constraint_name != NULL);
+
+		catalog_become_owner(catalog_get(), &sec_ctx);
+		snprintf(constrname,
+				 100,
+				 "%d_" INT64_FORMAT "_%s",
+				 chunk_id,
+				 catalog_table_next_seq_id(catalog_get(), CHUNK_CONSTRAINT),
+				 hypertable_constraint_name);
+		catalog_restore_user(&sec_ctx);
+
+		namestrcpy(dst, constrname);
+	}
+}
+
 static ChunkConstraint *
 chunk_constraints_add(ChunkConstraints *ccs,
 					  int32 chunk_id,
@@ -81,30 +113,14 @@ chunk_constraints_add(ChunkConstraints *ccs,
 
 	if (NULL == constraint_name)
 	{
+		chunk_constraint_choose_name(&cc->fd.constraint_name,
+									 is_dimension_constraint(cc),
+									 cc->fd.dimension_slice_id,
+									 hypertable_constraint_name,
+									 cc->fd.chunk_id);
+
 		if (is_dimension_constraint(cc))
-		{
-			snprintf(NameStr(cc->fd.constraint_name),
-					 NAMEDATALEN,
-					 "constraint_%d",
-					 cc->fd.dimension_slice_id);
 			namestrcpy(&cc->fd.hypertable_constraint_name, "");
-		}
-		else if (NULL != hypertable_constraint_name)
-		{
-			CatalogSecurityContext sec_ctx;
-			char		constrname[100];
-
-			catalog_become_owner(catalog_get(), &sec_ctx);
-			snprintf(constrname,
-					 100,
-					 "%d_" INT64_FORMAT "_%s",
-					 cc->fd.chunk_id,
-				  catalog_table_next_seq_id(catalog_get(), CHUNK_CONSTRAINT),
-					 hypertable_constraint_name);
-			catalog_restore_user(&sec_ctx);
-
-			namestrcpy(&cc->fd.constraint_name, constrname);
-		}
 	}
 	else
 		namestrcpy(&cc->fd.constraint_name, constraint_name);
@@ -189,22 +205,33 @@ chunk_constraint_insert(ChunkConstraint *constraint)
 
 
 static ChunkConstraint *
-chunk_constraints_add_from_tuple(ChunkConstraints *ccs, HeapTuple tuple)
+chunk_constraints_add_from_tuple(ChunkConstraints *ccs, TupleInfo *ti)
 {
-	FormData_chunk_constraint *form = (FormData_chunk_constraint *) GETSTRUCT(tuple);
-	int32		dimension_slice_id = form->dimension_slice_id;
-	const char *hypertable_constraint_name = NameStr(form->hypertable_constraint_name);
+	bool		nulls[Natts_chunk_constraint];
+	Datum		values[Natts_chunk_constraint];
+	int32		dimension_slice_id;
+	Name		constraint_name;
+	Name		hypertable_constraint_name;
 
-	if (heap_attisnull(tuple, Anum_chunk_constraint_dimension_slice_id))
+	heap_deform_tuple(ti->tuple, ti->desc, values, nulls);
+
+	constraint_name = DatumGetName(values[Anum_chunk_constraint_constraint_name - 1]);
+	if (heap_attisnull(ti->tuple, Anum_chunk_constraint_dimension_slice_id))
+	{
 		dimension_slice_id = 0;
+		hypertable_constraint_name = DatumGetName(values[Anum_chunk_constraint_hypertable_constraint_name - 1]);
+	}
 	else
-		hypertable_constraint_name = "";
+	{
+		dimension_slice_id = DatumGetInt32(values[Anum_chunk_constraint_dimension_slice_id - 1]);
+		hypertable_constraint_name = DatumGetName(DirectFunctionCall1(namein, CStringGetDatum("")));
+	}
 
 	return chunk_constraints_add(ccs,
-								 form->chunk_id,
+				   DatumGetInt32(values[Anum_chunk_constraint_chunk_id - 1]),
 								 dimension_slice_id,
-								 NameStr(form->constraint_name),
-								 hypertable_constraint_name);
+								 pstrdup(NameStr(*constraint_name)),
+							  pstrdup(NameStr(*hypertable_constraint_name)));
 }
 
 /*
@@ -316,7 +343,7 @@ chunk_constraint_tuple_found(TupleInfo *ti, void *data)
 {
 	ChunkConstraints *ccs = data;
 
-	chunk_constraints_add_from_tuple(ccs, ti->tuple);
+	chunk_constraints_add_from_tuple(ccs, ti);
 
 	return true;
 }
@@ -408,7 +435,7 @@ chunk_constraint_dimension_slice_id_tuple_found(TupleInfo *ti, void *data)
 	else
 		chunk = entry->chunk;
 
-	chunk_constraints_add_from_tuple(chunk->constraints, ti->tuple);
+	chunk_constraints_add_from_tuple(chunk->constraints, ti);
 
 	hypercube_add_slice(chunk->cube, ccsd->slice);
 
@@ -546,12 +573,25 @@ chunk_constraint_create_on_chunk(Chunk *chunk, Oid constraint_oid)
 							chunk->fd.hypertable_id);
 }
 
+typedef struct HypertableConstraintOperation
+{
+	const char *hypertable_constraint_name;
+} HypertableConstraintOperation;
+
 typedef struct DeleteConstraintInfo
 {
+	const char *hypertable_constraint_name;
 	int32		chunk_id;
 	Oid			chunk_oid;
-	char	   *hypertable_constraint_name;
 } DeleteConstraintInfo;
+
+typedef struct RenameHypertableConstraintInfo
+{
+	const char *hypertable_constraint_name;
+	int32		chunk_id;
+	const char *newname;
+} RenameHypertableConstraintInfo;
+
 
 static bool
 chunk_constraint_delete_tuple(TupleInfo *ti, void *data)
@@ -575,22 +615,20 @@ chunk_constraint_delete_tuple(TupleInfo *ti, void *data)
 static bool
 hypertable_constraint_tuple_filter(TupleInfo *ti, void *data)
 {
-	DeleteConstraintInfo *info = data;
+	HypertableConstraintOperation *info = data;
 	bool		nulls[Natts_chunk_constraint];
 	Datum		values[Natts_chunk_constraint];
-	int32		chunk_id;
 	const char *constrname;
+	HeapTuple	tuple = heap_copytuple(ti->tuple);
 
-	heap_deform_tuple(ti->tuple, ti->desc, values, nulls);
+	heap_deform_tuple(tuple, ti->desc, values, nulls);
 
 	if (nulls[Anum_chunk_constraint_hypertable_constraint_name - 1])
 		return false;
 
-	chunk_id = DatumGetInt32(values[Anum_chunk_constraint_chunk_id - 1]);
 	constrname = NameStr(*DatumGetName(values[Anum_chunk_constraint_hypertable_constraint_name - 1]));
 
-	return info->chunk_id == chunk_id &&
-		NULL != info->hypertable_constraint_name &&
+	return NULL != info->hypertable_constraint_name &&
 		strcmp(info->hypertable_constraint_name, constrname) == 0;
 }
 
@@ -639,4 +677,73 @@ chunk_constraint_recreate(ChunkConstraint *cc, Oid chunk_oid)
 
 	performDeletion(&constrobj, DROP_RESTRICT, 0);
 	chunk_constraint_create_on_table(cc, chunk_oid);
+}
+
+static void
+chunk_constraint_rename_on_chunk_table(int32 chunk_id, char *old_name, char *new_name)
+{
+	Chunk	   *chunk = chunk_get_by_id(chunk_id, 0, true);
+	RenameStmt	rename = {
+		.renameType = OBJECT_TABCONSTRAINT,
+		.relation = makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), 0),
+		.subname = old_name,
+		.newname = new_name,
+	};
+
+	RenameConstraint(&rename);
+}
+
+static bool
+chunk_constraint_rename_hypertable_tuple(TupleInfo *ti, void *data)
+{
+	RenameHypertableConstraintInfo *info = data;
+
+	bool		nulls[Natts_chunk_constraint];
+	Datum		values[Natts_chunk_constraint];
+	bool		repl[Natts_chunk_constraint] = {false};
+
+	HeapTuple	tuple;
+	NameData	new_hypertable_constraint_name;
+	NameData	new_chunk_constraint_name;
+	Name		old_chunk_constraint_name;
+
+	heap_deform_tuple(ti->tuple, ti->desc, values, nulls);
+
+	namestrcpy(&new_hypertable_constraint_name, info->newname);
+	chunk_constraint_choose_name(&new_chunk_constraint_name,
+								 false,
+								 0,
+								 info->newname,
+				  DatumGetInt32(values[Anum_chunk_constraint_chunk_id - 1]));
+
+
+	values[Anum_chunk_constraint_hypertable_constraint_name - 1] = NameGetDatum(&new_hypertable_constraint_name);
+	repl[Anum_chunk_constraint_hypertable_constraint_name - 1] = true;
+	old_chunk_constraint_name = DatumGetName(values[Anum_chunk_constraint_constraint_name - 1]);
+	values[Anum_chunk_constraint_constraint_name - 1] = NameGetDatum(&new_chunk_constraint_name);
+	repl[Anum_chunk_constraint_constraint_name - 1] = true;
+
+	chunk_constraint_rename_on_chunk_table(info->chunk_id, NameStr(*old_chunk_constraint_name), NameStr(new_chunk_constraint_name));
+
+	tuple = heap_modify_tuple(ti->tuple, ti->desc, values, nulls, repl);
+	catalog_update(ti->scanrel, tuple);
+	heap_freetuple(tuple);
+
+	return true;
+}
+
+int
+chunk_constraint_rename_hypertable_constraint(int32 chunk_id, const char *oldname, const char *newname)
+{
+	RenameHypertableConstraintInfo info = {
+		.hypertable_constraint_name = oldname,
+		.chunk_id = chunk_id,
+		.newname = newname,
+	};
+
+	return chunk_constraint_scan_by_chunk_id_internal(chunk_id,
+									chunk_constraint_rename_hypertable_tuple,
+										  hypertable_constraint_tuple_filter,
+													  &info,
+													  RowExclusiveLock);
 }
